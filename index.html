@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Blueberry Quality Checker</title>
+  <link rel="manifest" href="data:application/json,{\"name\":\"Blueberry Quality Checker\",\"short_name\":\"Berries\",\"start_url\":\".\",\"display\":\"standalone\",\"background_color\":\"#0b1220\",\"theme_color\":\"#0ea5e9\"}" />
+  <style>
+    :root { --bg:#0b1220; --card:#111827; --accent:#0ea5e9; --ok:#16a34a; --bad:#ef4444; --text:#e5e7eb; }
+    html,body{height:100%;}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Helvetica,Arial,sans-serif;}
+    .wrap{display:grid;grid-template-rows:auto 1fr auto;min-height:100%;}
+    header{padding:14px 16px;border-bottom:1px solid #1f2937;background:linear-gradient(180deg,#0d1628,#0b1220);} 
+    header h1{margin:0;font-size:18px;letter-spacing:.2px;}
+    .card{margin:12px;padding:12px;border-radius:18px;background:var(--card);box-shadow:0 10px 30px rgba(0,0,0,.4);} 
+    .controls{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 0}
+    button,select,input[type=range]{appearance:none;border:1px solid #1f2937;background:#0f172a;color:var(--text);padding:10px 12px;border-radius:12px;font-weight:600}
+    button:disabled{opacity:.5}
+    .status{display:flex;align-items:center;gap:10px;margin-top:10px}
+    .pill{padding:6px 10px;border-radius:999px;font-weight:800;letter-spacing:.3px}
+    .ok{background:rgba(22,163,74,.16);border:1px solid rgba(22,163,74,.4);color:#86efac}
+    .bad{background:rgba(239,68,68,.16);border:1px solid rgba(239,68,68,.4);color:#fecaca}
+    .neutral{background:rgba(14,165,233,.16);border:1px solid rgba(14,165,233,.4);color:#bae6fd}
+    .grid{display:grid;grid-template-columns:1fr;gap:12px}
+    .row{display:flex;justify-content:space-between;gap:8px;align-items:center}
+    .prob{height:6px;background:#0b1220;border-radius:999px;overflow:hidden;flex:1}
+    .prob > span{display:block;height:100%;background:linear-gradient(90deg,var(--accent),#22d3ee)}
+    footer{padding:12px;text-align:center;color:#9ca3af}
+    video{width:100%;border-radius:16px;background:#000;}
+    canvas{width:100%;border-radius:16px;background:transparent;}
+    .hint{font-size:12px;color:#9ca3af}
+    .result{ text-align:center; font-size: clamp(28px, 8vw, 72px); font-weight: 900; margin-top:12px; }
+  .oktxt{ color:#86efac; }
+  .badtxt{ color:#fecaca; }
+  .toolbar{ display:flex; justify-content:center; gap:10px; }
+  .videoSquare{ aspect-ratio: 1 / 1; width:100%; max-width:480px; margin:12px auto 0; background:#000; border-radius:16px; overflow:hidden; }
+  #video{ width:100%; height:100%; object-fit:cover; display:block; }
+  .videoSquare{ position: relative; }
+  #overlay{ position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+  .confidence{ text-align:center; font-size: clamp(12px, 3.2vw, 20px); font-weight: 600; margin-top:4px; color:#9ca3af; }
+</style>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8.5/dist/teachablemachine-image.min.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Blueberry Quality Checker</h1>
+  </header>
+
+  <main class="card">
+  <div class="toolbar">
+    <button id="startBtn">Start Camera</button>
+    <button id="offBtn" disabled>Camera Off</button>
+  </div>
+  <div class="videoSquare">
+    <video id="video" playsinline muted></video>
+  </div>
+  <div id="result" class="result">&nbsp;</div>
+  <div id="conf" class="confidence">&nbsp;</div>
+</main>
+
+  <footer>
+    Powered by Teachable Machine (TF.js). This app runs entirely on your device.
+  </footer>
+</div>
+
+<script>
+(async function(){
+  const MODEL_BASE = "https://teachablemachine.withgoogle.com/models/--NFuyxeb/";
+  const GOOD_RAW = ["Set G","G","Good"];
+  const BAD_RAW  = ["Set B","B","Bad"];
+
+  // Single-berry gating (relaxed, supports dark purple/near-black)
+  const THRESHOLD = 0.70;      // min prob to consider a result (0-1)
+  const MARGIN    = 0.15;      // top prob must exceed #2 by this much
+  const STABLE_FRAMES = 2;     // require this many consecutive agreeing frames
+  const COLOR_GATE_ENABLED = true;  // only accept if center region appears blueberry-like
+  const COLOR_BLUE_RATIO = 0.06;    // >= 6% of sampled pixels must match
+
+  let model, stream = null, running = false;
+  const startBtn = document.getElementById('startBtn');
+  const offBtn   = document.getElementById('offBtn');
+  const video    = document.getElementById('video');
+  const resultEl = document.getElementById('result');
+  const confEl   = document.getElementById('conf');
+
+  // stability tracking
+  let lastCandidate = null; // 'good' | 'bad' | null
+  let framesSame = 0;
+  let currentStatus = null;
+
+  function setResult(status, prob){ // 'good' | 'bad' | null
+    resultEl.className = 'result ' + (status==='good' ? 'oktxt' : status==='bad' ? 'badtxt' : '');
+    resultEl.textContent = status==='good' ? 'GOOD' : status==='bad' ? 'BAD' : '';
+    if (status){
+      const pct = Math.round((prob||0)*100);
+      confEl.textContent = `${pct}% Confidence`;
+    } else {
+      confEl.textContent = '';
+    }
+  }
+
+  async function loadModel(){
+    if (!model) model = await tmImage.load(MODEL_BASE+"model.json", MODEL_BASE+"metadata.json");
+  }
+
+  async function startCamera(){
+    await loadModel();
+    if (stream) stopCamera();
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+    video.srcObject = stream;
+    await video.play();
+    running = true;
+    startBtn.disabled = true;
+    offBtn.disabled = false;
+    requestAnimationFrame(loop);
+  }
+
+  function stopCamera(){
+    running = false;
+    if (stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; }
+    video.srcObject = null;
+    offBtn.disabled = true;
+    startBtn.disabled = false;
+    lastCandidate = null; framesSame = 0; currentStatus = null;
+    setResult(null, null);
+  }
+
+  function rgbToHsv(r,g,b){
+    r/=255; g/=255; b/=255;
+    const max = Math.max(r,g,b), min = Math.min(r,g,b);
+    const d = max - min; let h = 0;
+    if (d !== 0){
+      switch(max){ case r: h = 60 * (((g-b)/d) % 6); break; case g: h = 60 * (((b-r)/d) + 2); break; case b: h = 60 * (((r-g)/d) + 4); break; }
+    }
+    if (h < 0) h += 360; const s = max===0?0:d/max; const v=max; return [h,s,v];
+  }
+
+  // More tolerant color gate: accepts blue → purple hues and dark berries
+  function centerLooksBlue(probTop=0){
+    if (!COLOR_GATE_ENABLED) return true;
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return false;
+    const boxW = Math.floor(vw * 0.4), boxH = Math.floor(vh * 0.4);
+    const sx = Math.floor((vw - boxW)/2), sy = Math.floor((vh - boxH)/2);
+
+    const sampleSize = 32;
+    const gate = document.createElement('canvas'); gate.width = gate.height = sampleSize;
+    const gctx = gate.getContext('2d', { willReadFrequently: true });
+    gctx.drawImage(video, sx, sy, boxW, boxH, 0, 0, sampleSize, sampleSize);
+    const { data } = gctx.getImageData(0,0,sampleSize,sampleSize);
+    let blueish = 0, total = sampleSize*sampleSize;
+    for (let i=0;i<data.length;i+=4){
+      const r = data[i], g = data[i+1], b = data[i+2];
+      const [h,s,v] = rgbToHsv(r,g,b);
+      const isBlueChannel = (b > r + 12) && (b > g + 12);
+      const isBluePurpleHue = (h >= 200 && h <= 330); // include purple range
+      const isNotWhite = !(r>220 && g>220 && b>220);
+      const ok = (
+        (isBluePurpleHue && s >= 0.08 && v >= 0.05) || // allow low sat / low light
+        (isBlueChannel && v >= 0.05 && isNotWhite)
+      );
+      if (ok) blueish++;
+    }
+    const ratio = blueish/total;
+    if (probTop >= 0.95) return true; // high-confidence bypass
+    return ratio >= COLOR_BLUE_RATIO;
+  }
+
+  async function loop(){
+    if(!running || !model || video.readyState < 2){ return running ? requestAnimationFrame(loop) : null; }
+    try{
+      const preds = await model.predict(video);
+      preds.sort((a,b)=> b.probability - a.probability);
+      const top = preds[0];
+      const second = preds[1] || { probability: 0 };
+      const label = top.className.toLowerCase();
+      const prob  = top.probability;
+
+      let candidate = null;
+      // apply recognition gates
+      const passesProb   = prob >= THRESHOLD;
+      const passesMargin = (prob - second.probability) >= MARGIN;
+      const passesColor  = centerLooksBlue(prob);
+
+      if (passesProb && passesMargin && passesColor){
+        if (GOOD_RAW.some(x=>label === x.toLowerCase())) candidate = 'good';
+        else if (BAD_RAW.some(x=>label === x.toLowerCase())) candidate = 'bad';
+      }
+
+      if (candidate){
+        if (candidate === lastCandidate){
+          framesSame++;
+        } else {
+          lastCandidate = candidate; framesSame = 1;
+        }
+        if (framesSame >= STABLE_FRAMES && candidate !== currentStatus){
+          currentStatus = candidate;
+          setResult(candidate, prob);
+        } else if (candidate === currentStatus){
+          setResult(candidate, prob);
+        }
+      } else {
+        lastCandidate = null; framesSame = 0;
+        if (currentStatus !== null){ currentStatus = null; setResult(null, null); }
+        else setResult(null, null);
+      }
+
+    }catch(err){ console.error(err); }
+    if (running) requestAnimationFrame(loop);
+  }
+
+  startBtn.addEventListener('click', ()=>{ startCamera().catch(e=>alert(e.message)); });
+  offBtn.addEventListener('click', stopCamera);
+})();
+</script>
+</body>
+</html>
